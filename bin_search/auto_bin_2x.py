@@ -78,83 +78,84 @@ def auto_bin_2x(
         default_sheet_name="近期数据",
         max_merge_cell_cnt=2,
     )
-    excel_writer.add_sheet("后段数据")
-
+    
     print("\n===============开始变量分箱搜索===============")
-    results = []
+    all_results = {}
+    latest_results = []
+    latest_time_range = None
+    latest_sheet_name = None
+    latest_seg_df = None
     for seg_df, sheet_name in [(right, "近期数据"), (left, "后段数据")]:
         time_range = f"{seg_df[time_col].min().strftime('%Y-%m-%d')}~{seg_df[time_col].max().strftime('%Y-%m-%d')}"
-        excel_writer.set_active_sheet(sheet_name)
-        # 近期数据和后段数据 只使用近期的分箱结果
+        # 1.维分箱搜索
+        print(f"1.开始{sheet_name}【{time_range}】时段1维分箱搜索")
+        results = []
+        for feat in features:
+            bin_df = _bin_feature(seg_df, feat, target, weight)
+            if bin_df is None or len(bin_df) < 2:
+                continue
+            rows = _merge_bins(bin_df.to_dict("records"), samples_min, max_bins=bins)
+            if len(rows) < 2:
+                continue
+            min_risk = min(r["risk"] for r in rows)
+            max_risk = max(r["risk"] for r in rows)
+            if min_risk < risk_min or max_risk > risk_max:
+                is_num = pd.api.types.is_numeric_dtype(seg_df[feat])
+                cuts = ( _extract_cuts(rows, seg_df[feat]) if is_num else _extract_categorical_cuts(rows) )
+                results.append({"feature": feat, "min_risk": round(min_risk, 4), "max_risk": round(max_risk, 4),
+                        "cuts": cuts, "bins": pd.DataFrame(rows), "sort_value": max_risk})
+        print(f"满足条件的特征【{len(results)}】个\n")
+        all_results[sheet_name] = results
         if sheet_name == "近期数据":
-            # 1.维分箱搜索
-            print(f"1.开始{sheet_name}【{time_range}】时段1维分箱搜索")
-            for feat in features:
-                bin_df = _bin_feature(seg_df, feat, target, weight)
-                if bin_df is None or len(bin_df) < 2:
-                    continue
-                rows = _merge_bins(bin_df.to_dict("records"), samples_min, max_bins=bins)
-                if len(rows) < 2:
-                    continue
-                min_risk = min(r["risk"] for r in rows)
-                max_risk = max(r["risk"] for r in rows)
-                if min_risk < risk_min or max_risk > risk_max:
-                    is_num = pd.api.types.is_numeric_dtype(seg_df[feat])
-                    cuts = ( _extract_cuts(rows, seg_df[feat]) if is_num else _extract_categorical_cuts(rows) )
-                    results.append(
-                        {
-                            "feature": feat,
-                            "min_risk": round(min_risk, 4),
-                            "max_risk": round(max_risk, 4),
-                            "cuts": cuts,
-                            "bins": pd.DataFrame(rows),
-                            "sort_value": max_risk,
-                        }
-                    )
-            print(f"满足条件的特征【{len(results)}】个\n")
+            latest_results = results
+            latest_time_range = time_range
+            latest_sheet_name = sheet_name
+            latest_seg_df = seg_df
         
-        # 2.二维交叉
-        print(f"2.开始{sheet_name}【{time_range}】时段2维变量交叉")
-        var_pairs = list(itertools.combinations(results, 2))
-        print(f"满足条件的变量交叉【{len(var_pairs)}】对\n")
-        risk_dfs = []
-        for idx, (p1, p2) in enumerate(var_pairs):
-            print(f"\r第{idx + 1}对变量交叉", flush=True, end="")
-            feat1, feat2 = p1["feature"], p2["feature"]
-            cut1, cut2 = p1["cuts"], p2["cuts"]
-            temp = seg_df[
-                [
-                    feat1,
-                    feat2,
-                    "target",
-                    "due_time_date",
-                    "trans_money",
-                    "repay_time_date",
-                    "repay_time",
-                    "penalty_day",
-                    "user_id",
-                    "borrow_id",
-                    "loan_time"
-                ]
-            ].copy()
-            temp[feat1] = get_bin_label(temp, feat1, cut1)
-            temp[feat2] = get_bin_label(temp, feat2, cut2)
-            risk_df = Risk.get_risk(temp, [feat1, feat2], need_col=risk_need_col, to_pct=True)
-            # 交换索引层级
-            risk_df = risk_df.swaplevel(i=0, j=1, axis=1).sort_index(axis=1)
-            first_row = risk_df["0+流入"].iloc[0].dropna().apply(lambda x: float(x.replace("%", ""))/100)
-            first_col = risk_df.iloc[:-1, 0].dropna().apply(lambda x: float(x.replace("%", ""))/100 )
-            first_row_is_rank = first_row.is_monotonic_increasing or first_row.is_monotonic_decreasing
-            first_col_is_rank = first_col.is_monotonic_increasing or first_col.is_monotonic_decreasing
-            if filter_rank:
-                if not(first_row_is_rank or first_col_is_rank):
-                    continue
-            risk_dfs.append((f"{feat1} / {feat2}", "title2"))
-            risk_dfs.append((risk_df,'df3'))
-        
-        # 3.写入excel
-        sheet_title = f"\n【{time_range}】时段2维变量交叉:{len(risk_dfs)//2}对。"
-        excel_writer.write_items([(sheet_title, "title1"), *risk_dfs])
+    # 2.二维交叉
+    filter_features = [r["feature"] for r in all_results["后段数据"]]
+    filter_results = [r for r in latest_results if r["feature"] in filter_features]
+    print(f"2.开始{latest_sheet_name}【{latest_time_range}】时段2维变量交叉")
+    var_pairs = list(itertools.combinations(filter_results, 2))
+    print(f"满足条件的变量交叉【{len(var_pairs)}】对\n")
+    risk_dfs = []
+    for idx, (p1, p2) in enumerate(var_pairs):
+        print(f"\r第{idx + 1}对变量交叉", flush=True, end="")
+        feat1, feat2 = p1["feature"], p2["feature"]
+        cut1, cut2 = p1["cuts"], p2["cuts"]
+        temp = latest_seg_df[
+            [
+                feat1,
+                feat2,
+                "target",
+                "due_time_date",
+                "trans_money",
+                "repay_time_date",
+                "repay_time",
+                "penalty_day",
+                "user_id",
+                "borrow_id",
+                "loan_time",
+            ]
+        ].copy()
+        temp[feat1] = get_bin_label(temp, feat1, cut1)
+        temp[feat2] = get_bin_label(temp, feat2, cut2)
+        risk_df = Risk.get_risk(temp, [feat1, feat2], need_col=risk_need_col, to_pct=True)
+        # 交换索引层级
+        risk_df = risk_df.swaplevel(i=0, j=1, axis=1).sort_index(axis=1)
+        first_row = risk_df["0+流入"].iloc[0].dropna().apply(lambda x: float(x.replace("%", ""))/100)
+        first_col = risk_df.iloc[:-1, 0].dropna().apply(lambda x: float(x.replace("%", ""))/100 )
+        first_row_is_rank = first_row.is_monotonic_increasing or first_row.is_monotonic_decreasing
+        first_col_is_rank = first_col.is_monotonic_increasing or first_col.is_monotonic_decreasing
+        if filter_rank:
+            if not(first_row_is_rank or first_col_is_rank):
+                continue
+        risk_dfs.append((f"{feat1} / {feat2}", "title2"))
+        risk_dfs.append((risk_df,'df3'))
+    
+    # 3.写入excel
+    sheet_title = f"\n【{latest_time_range}】时段2维变量交叉:{len(risk_dfs) // 2}对。"
+    excel_writer.write_items([(sheet_title, "title1"), *risk_dfs])
         
     excel_writer.close()
     print("\n===============完成===============")
