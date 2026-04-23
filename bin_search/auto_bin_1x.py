@@ -264,8 +264,7 @@ def extract_cutpoint(results, risk_min, risk_max, seg_df):
         if isinstance(val, str):
             return float(val.strip("%")) / 100
         return float(val)
-
-    def _repair_endpoint(value, op, series):
+    def _repair_endpoint(value, series):
         """把端点值修复为数据中实际存在的值。"""
         if series[series == value].size > 0:
             return value
@@ -276,8 +275,6 @@ def extract_cutpoint(results, risk_min, risk_max, seg_df):
     for item in results:
         feature = item['feature']
         risk_df = item['risk_df']
-        cuts = item['cuts']
-
         # risk_df 单维度时 index 是分箱标签，去掉合计行
         idx = risk_df.index
         if '合计' in idx:
@@ -286,7 +283,7 @@ def extract_cutpoint(results, risk_min, risk_max, seg_df):
         risk_col = risk_df.loc[idx, '0+流入'].apply(_pct_to_float)
         min_risk_labels = set(risk_col[risk_col <= risk_min].index)
         max_risk_labels = set(risk_col[risk_col >= risk_max].index)
-        is_num = isinstance(cuts[0], (int, float)) and not isinstance(cuts[0], tuple)
+        is_num = isinstance(item['cuts'][0], (int, float)) and not isinstance(item['cuts'][0], tuple)
         if not is_num:
             # 离散型：index 是元组对象，直接匹配
             def _flatten(labels):
@@ -297,27 +294,17 @@ def extract_cutpoint(results, risk_min, risk_max, seg_df):
             cutpoint_min_risk = _flatten(min_risk_labels)
             cutpoint_max_risk = _flatten(max_risk_labels)
         else:
-            # 连续型：cuts 是 [-inf, v1, v2, ..., inf] 形式
-            series = seg_df[feature]
-            has_missing = (series == -9999979).any()
-            finite_cuts = [c for c in cuts if np.isfinite(c)]  # 去掉 ±inf
-
-            # 把 label 字符串 "(left, right]" 解析回 (left, right)
             def _parse_label(label):
                 label = label.strip()
                 # 处理缺失值箱 label 可能是 "(-inf, v]" 或含 -9999979
                 parts = label.strip('(]').split(', ')
                 return float(parts[0]), float(parts[1])
-
             def _bins_for_labels(labels):
                 """找出命中 label 集合对应的连续区间端点列表。"""
                 matched = []
                 for label in labels:
-                    try:
-                        l, r = _parse_label(str(label))
-                        matched.append((l, r))
-                    except Exception:
-                        pass
+                    l, r = _parse_label(str(label))
+                    matched.append((l, r))
                 if not matched:
                     return []
                 matched.sort(key=lambda x: x[0])
@@ -329,52 +316,33 @@ def extract_cutpoint(results, risk_min, risk_max, seg_df):
                     else:
                         merged.append((l, r))
                 return merged
-
-            def _missing_label_hit(labels):
-                """判断命中的 label 集合中是否包含缺失箱（左端点为 -inf 且右端点为 finite_cuts[0]）。"""
-                if not has_missing or not finite_cuts:
-                    return False
-                missing_right = finite_cuts[0]
-                for lbl in labels:
-                    try:
-                        l, r = _parse_label(str(lbl))
-                        if not np.isfinite(l) and r == missing_right:
-                            return True
-                    except Exception:
-                        pass
-                return False
-
-            def _to_conditions(merged, labels):
-                """把合并后的区间转为 [(value, 'gt'|'lte')] 条件列表。"""
-                if not merged:
+            def _parse_conditions(_merged, _feature):
+                _series = seg_df[_feature]
+                if not _merged:
                     return []
-                missing_hit = _missing_label_hit(labels)
-                conditions = []
-                for seg_l, seg_r in merged:
-                    if np.isfinite(seg_l):
-                        left_val = _repair_endpoint(seg_l, 'gt', series)
-                        conditions.append((left_val, 'gt'))
-                        if missing_hit:
-                            conditions.append((-9999979, "eq"))
-                    if np.isfinite(seg_r):
-                        right_val = _repair_endpoint(seg_r, 'lte', series)
-                        conditions.append((right_val, 'lte'))
-                        if has_missing and not missing_hit:
-                            conditions.append((9999979, "gt"))
-                return conditions
-
+                elif len(_merged) == 1:
+                    if np.isneginf(_merged[0][0]):
+                        return [(_repair_endpoint(_merged[0][1], _series), 'lte')]
+                    elif np.isposinf(_merged[0][1]):
+                        return [(_repair_endpoint(_merged[0][0], _series), 'gt')]
+                    elif _merged[0][0] == -9999979:
+                        return [(-9999979, 'gt'), (_repair_endpoint(_merged[0][1], _series), 'lte')]
+                elif len(_merged) == 2:
+                    if np.isneginf(_merged[0][0]) and _merged[0][1] == -9999979 :
+                        return [(-9999979, 'lte'), (_repair_endpoint(_merged[1][0], _series), 'gt')]
+                raise ValueError(f"不支持的分箱点类型: {feature} {_merged}")
+            
             merged_min = _bins_for_labels(min_risk_labels)
+            cutpoint_min_risk = _parse_conditions(merged_min, feature)
             merged_max = _bins_for_labels(max_risk_labels)
-            cutpoint_min_risk = _to_conditions(merged_min, min_risk_labels)
-            cutpoint_max_risk = _to_conditions(merged_max, max_risk_labels)
-
+            cutpoint_max_risk = _parse_conditions(merged_max, feature)
+            
         result = {
             'feature': feature,
             'cutpoint_min_risk': cutpoint_min_risk,
             'cutpoint_max_risk': cutpoint_max_risk,
         }
         item['cutpoint'] = result
-        print(result)
 
 if __name__ == "__main__":
     df = pd.read_parquet("/home/lim/data/project/sst_model_tool/src/sst/strategy2/bin_search/data.pq")
