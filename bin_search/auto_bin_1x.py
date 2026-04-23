@@ -136,8 +136,6 @@ def get_bin_label(df, feature, cuts):
 def save_excel(excel_writer, df, results, sheet_name, sheet_title, need_col=None, risk_dim2=False):
     # 切换到指定sheet
     excel_writer.set_active_sheet(sheet_name)
-    # 按挑中分箱的样本数排序，从大到小
-    results = sorted(results, key=lambda x: x['sort_value'], reverse=True)
     risk_dfs = []
     for item in results:
         feature = item['feature']
@@ -164,6 +162,7 @@ def save_excel(excel_writer, df, results, sheet_name, sheet_title, need_col=None
             need_col=need_col or ["交易单数", "交易人数", "交易金额", "金额占比", "0+流入", "3+流入"], 
             to_pct=True
         )
+        item["bins"] = risk_df
         risk_dfs.append(risk_df)
     excel_writer.write_items([(sheet_title, "title1"), *risk_dfs])
 
@@ -232,12 +231,13 @@ def auto_bin_1x(
                 results.append({'feature': feat, 'min_risk': round(min_risk, 4), 'max_risk': round(max_risk, 4),
                                 'cuts': cuts, 'bins': pd.DataFrame(rows), 'sort_value': max_risk})
         print(f"满足条件的特征【{len(results)}】个, 开始保存excel")
+        results = sorted(results, key=lambda x: x["sort_value"], reverse=True)
         sheet_title = f"【{time_range}】时段搜索结果:{len(results)}个变量。risk_min:【{risk_min}】,risk_max:【{risk_max}】,samples_min:【{samples_min}】"
         save_excel(excel_writer, seg_df, results, sheet_name, sheet_title, need_col=risk_need_col)
         all_results[sheet_name] = results
     # 整体数据
     print("整体数据")
-    results = all_results["近期数据"]
+    results = all_results["近期数据"].copy()
     sheet_title = f"整体数据使用近期数据的分箱。risk_min:【{risk_min}】,risk_max:【{risk_max}】,samples_min:【{samples_min}】"
     save_excel(excel_writer, total, results, "整体数据", sheet_title, need_col=risk_need_col, risk_dim2=True)
     excel_writer.close()
