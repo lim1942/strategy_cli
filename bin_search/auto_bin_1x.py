@@ -20,6 +20,7 @@ def _bin_feature(df, feature, target, weight, init_bins=2000):
                  .reset_index())
 
     if is_num:
+        tmp = tmp[tmp['x']!=-9999979]
         try:
             tmp['g'], edges = pd.qcut(tmp['x'], q=init_bins, duplicates='drop', retbins=True, labels=False)
         except Exception:
@@ -162,7 +163,7 @@ def save_excel(excel_writer, df, results, sheet_name, sheet_title, need_col=None
             need_col=need_col or ["交易单数", "交易人数", "交易金额", "金额占比", "0+流入", "3+流入"], 
             to_pct=True
         )
-        item["bins"] = risk_df
+        item["risk_df"] = risk_df
         risk_dfs.append(risk_df)
     excel_writer.write_items([(sheet_title, "title1"), *risk_dfs])
 
@@ -235,6 +236,9 @@ def auto_bin_1x(
         sheet_title = f"【{time_range}】时段搜索结果:{len(results)}个变量。risk_min:【{risk_min}】,risk_max:【{risk_max}】,samples_min:【{samples_min}】"
         save_excel(excel_writer, seg_df, results, sheet_name, sheet_title, need_col=risk_need_col)
         all_results[sheet_name] = results
+        # 提取分箱点
+        extract_cutpoint(results, risk_min, risk_max, seg_df)
+        
     # 整体数据
     print("整体数据")
     results = all_results["近期数据"].copy()
@@ -243,6 +247,134 @@ def auto_bin_1x(
     excel_writer.close()
     print("\n===============完成===============")
     return all_results
+
+def extract_cutpoint(results, risk_min, risk_max, seg_df):
+    """
+    提取get_risk返回的risk_df中的分箱点, 把0+流入列转换为浮点数。
+    按照0+流入小于等于risk_min提取: cutpoint_min_risk
+    按照0+流入大于等于risk_max提取: cutpoint_max_risk
+    1.离散型的变量： 直接提取枚举值到一个列表中。 比如 cutpoint_min_risk = ['a', 'b', 'c'], cutpoint_max_risk = ['d', 'e', 'f']
+    2.连续型的变量：
+        (1).提取分箱的端点的条件的数值范围(无缺失值): cutpoint_min_risk=[(value, 'gt|lte')], cutpoint_max_risk=[(value, 'gt|lte')]
+        (2).提取分箱的端点的条件的数值范围(有缺失值): 若缺失和现有分界点冲突, 需要cutpoint_min_risk=[(-9999979, 'gt|lte'), (value, 'gt|lte')]。
+        (3).端点值修复: 把lte的端点值修改为seg_df[feature_name]中小于端点的最大值，把gt的端点值修改为seg_df[feature_name]中大于端点的最小值。
+    """
+    def _pct_to_float(val):
+        """把百分比字符串或浮点数转为浮点数。"""
+        if isinstance(val, str):
+            return float(val.strip("%")) / 100
+        return float(val)
+
+    def _repair_endpoint(value, op, series):
+        """把端点值修复为数据中实际存在的值。"""
+        if series[series == value].size > 0:
+            return value
+        real = series[(series != -9999979) & series.notna()]
+        candidates = real[real <= value]
+        return candidates.max() if not candidates.empty else value
+
+    for item in results:
+        feature = item['feature']
+        risk_df = item['risk_df']
+        cuts = item['cuts']
+
+        # risk_df 单维度时 index 是分箱标签，去掉合计行
+        idx = risk_df.index
+        if '合计' in idx:
+            idx = idx.drop('合计')
+        # 把 0+流入 列转为浮点数
+        risk_col = risk_df.loc[idx, '0+流入'].apply(_pct_to_float)
+        min_risk_labels = set(risk_col[risk_col <= risk_min].index)
+        max_risk_labels = set(risk_col[risk_col >= risk_max].index)
+        is_num = isinstance(cuts[0], (int, float)) and not isinstance(cuts[0], tuple)
+        if not is_num:
+            # 离散型：index 是元组对象，直接匹配
+            def _flatten(labels):
+                vals = []
+                for lable in labels:
+                    vals.extend(lable)
+                return vals
+            cutpoint_min_risk = _flatten(min_risk_labels)
+            cutpoint_max_risk = _flatten(max_risk_labels)
+        else:
+            # 连续型：cuts 是 [-inf, v1, v2, ..., inf] 形式
+            series = seg_df[feature]
+            has_missing = (series == -9999979).any()
+            finite_cuts = [c for c in cuts if np.isfinite(c)]  # 去掉 ±inf
+
+            # 把 label 字符串 "(left, right]" 解析回 (left, right)
+            def _parse_label(label):
+                label = label.strip()
+                # 处理缺失值箱 label 可能是 "(-inf, v]" 或含 -9999979
+                parts = label.strip('(]').split(', ')
+                return float(parts[0]), float(parts[1])
+
+            def _bins_for_labels(labels):
+                """找出命中 label 集合对应的连续区间端点列表。"""
+                matched = []
+                for label in labels:
+                    try:
+                        l, r = _parse_label(str(label))
+                        matched.append((l, r))
+                    except Exception:
+                        pass
+                if not matched:
+                    return []
+                matched.sort(key=lambda x: x[0])
+                # 合并连续区间
+                merged = [matched[0]]
+                for l, r in matched[1:]:
+                    if l <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], r))
+                    else:
+                        merged.append((l, r))
+                return merged
+
+            def _missing_label_hit(labels):
+                """判断命中的 label 集合中是否包含缺失箱（左端点为 -inf 且右端点为 finite_cuts[0]）。"""
+                if not has_missing or not finite_cuts:
+                    return False
+                missing_right = finite_cuts[0]
+                for lbl in labels:
+                    try:
+                        l, r = _parse_label(str(lbl))
+                        if not np.isfinite(l) and r == missing_right:
+                            return True
+                    except Exception:
+                        pass
+                return False
+
+            def _to_conditions(merged, labels):
+                """把合并后的区间转为 [(value, 'gt'|'lte')] 条件列表。"""
+                if not merged:
+                    return []
+                missing_hit = _missing_label_hit(labels)
+                conditions = []
+                for seg_l, seg_r in merged:
+                    if np.isfinite(seg_l):
+                        left_val = _repair_endpoint(seg_l, 'gt', series)
+                        conditions.append((left_val, 'gt'))
+                        if missing_hit:
+                            conditions.append((-9999979, "eq"))
+                    if np.isfinite(seg_r):
+                        right_val = _repair_endpoint(seg_r, 'lte', series)
+                        conditions.append((right_val, 'lte'))
+                        if has_missing and not missing_hit:
+                            conditions.append((9999979, "gt"))
+                return conditions
+
+            merged_min = _bins_for_labels(min_risk_labels)
+            merged_max = _bins_for_labels(max_risk_labels)
+            cutpoint_min_risk = _to_conditions(merged_min, min_risk_labels)
+            cutpoint_max_risk = _to_conditions(merged_max, max_risk_labels)
+
+        result = {
+            'feature': feature,
+            'cutpoint_min_risk': cutpoint_min_risk,
+            'cutpoint_max_risk': cutpoint_max_risk,
+        }
+        item['cutpoint'] = result
+        print(result)
 
 if __name__ == "__main__":
     df = pd.read_parquet("/home/lim/data/project/sst_model_tool/src/sst/strategy2/bin_search/data.pq")
