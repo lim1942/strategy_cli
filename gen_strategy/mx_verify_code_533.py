@@ -748,6 +748,8 @@ def DD1012(row):
         return 'REJECT'
     return 'PASS'
 
+row["all102RegTimeIntervalMin"] < 15 and row["all102RegTimeIntervalMin"] > 1
+
 def DD1013(row):
     if row['all067LoanNowPlatformCnt'] > 0 and row['all088SameIDcardAppyLoanOnlineNum'] == 0 and row['biz037AppId'] != "sst001_NBR-008":
         return 'REJECT'
